@@ -34,6 +34,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
 
+    /* package */ static final String PseuoHostNamePrefix = "FenzoPsueodHost-";
+
     private static class PortRange {
         private final VirtualMachineLease.Range range;
         private PortRange(VirtualMachineLease.Range range) {
@@ -97,6 +99,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         }
     }
 
+    private final PreferentialNamedConsumableResourceEvaluator preferentialNamedConsumableResourceEvaluator;
     private final Map<String, VirtualMachineLease> leasesMap;
     private final BlockingQueue<String> workersToUnAssign;
     private final BlockingQueue<String> leasesToExpire;
@@ -104,7 +107,8 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
     private final Action1<VirtualMachineLease> leaseRejectAction;
     private final long leaseOfferExpirySecs;
     private final String hostname;
-    // ToDo abstract out into VMResources
+    private final Map<String, Double> currTotalScalars = new HashMap<>();
+    private final Map<String, Double> currUsedScalars = new HashMap<>();
     private double currTotalCpus=0.0;
     private double currUsedCpus=0.0;
     private double currTotalMemory=0.0;
@@ -115,7 +119,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
     private double currUsedDisk=0.0;
     private VirtualMachineLease currTotalLease=null;
     private PortRanges currPortRanges = new PortRanges();
-    private Map<String, Protos.Attribute> currAttributesMap = new HashMap<>();
+    private volatile Map<String, Protos.Attribute> currAttributesMap = Collections.emptyMap();
     private final Map<String, PreferentialNamedConsumableResourceSet> resourceSets = new HashMap<>();
     // previouslyAssignedTasksMap contains tasks on this VM before current scheduling iteration started. This is
     // available for optimization of scheduling assignments for such things as locality with other similar tasks, etc.
@@ -135,30 +139,26 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
     private String exclusiveTaskId =null;
     private final boolean singleLeaseMode;
     private boolean firstLeaseAdded=false;
+    private final List<TaskRequest> consumedResourcesToAssign = new ArrayList<>();
 
-    public AssignableVirtualMachine(ConcurrentMap<String, String> vmIdToHostnameMap,
+    public AssignableVirtualMachine(PreferentialNamedConsumableResourceEvaluator preferentialNamedConsumableResourceEvaluator,
+                                    ConcurrentMap<String, String> vmIdToHostnameMap,
                                     ConcurrentMap<String, String> leaseIdToHostnameMap,
                                     String hostname, Action1<VirtualMachineLease> leaseRejectAction,
                                     long leaseOfferExpirySecs, TaskTracker taskTracker) {
-        this(vmIdToHostnameMap, leaseIdToHostnameMap, hostname, leaseRejectAction, leaseOfferExpirySecs, taskTracker, false);
+        this(preferentialNamedConsumableResourceEvaluator, vmIdToHostnameMap, leaseIdToHostnameMap, hostname, leaseRejectAction, leaseOfferExpirySecs, taskTracker, false);
     }
 
-    public AssignableVirtualMachine(ConcurrentMap<String, String> vmIdToHostnameMap,
+    public AssignableVirtualMachine(PreferentialNamedConsumableResourceEvaluator preferentialNamedConsumableResourceEvaluator,
+                                    ConcurrentMap<String, String> vmIdToHostnameMap,
                                     ConcurrentMap<String, String> leaseIdToHostnameMap,
                                     String hostname, Action1<VirtualMachineLease> leaseRejectAction,
                                     long leaseOfferExpirySecs, TaskTracker taskTracker, boolean singleLeaseMode) {
+        this.preferentialNamedConsumableResourceEvaluator = preferentialNamedConsumableResourceEvaluator;
         this.vmIdToHostnameMap = vmIdToHostnameMap;
         this.leaseIdToHostnameMap = leaseIdToHostnameMap;
         this.hostname = hostname;
-        this.leaseRejectAction = leaseRejectAction==null?
-                new Action1<VirtualMachineLease>() {
-                    @Override
-                    public void call(VirtualMachineLease lease) {
-                        logger.warn("No lease reject action registered to reject lease id " + lease.getId() +
-                                " on host " + lease.hostname());
-                    }
-                } :
-                leaseRejectAction;
+        this.leaseRejectAction = getWrappedLeaseRejectAction(leaseRejectAction);
         this.leaseOfferExpirySecs = leaseOfferExpirySecs;
         this.taskTracker = taskTracker;
         this.leasesMap = new HashMap<>();
@@ -170,10 +170,33 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         this.singleLeaseMode = singleLeaseMode;
     }
 
+    private Action1<VirtualMachineLease> getWrappedLeaseRejectAction(final Action1<VirtualMachineLease> leaseRejectAction) {
+        return leaseRejectAction==null?
+                lease -> logger.warn("No lease reject action registered to reject lease id " + lease.getId() +
+                        " on host " + lease.hostname()) :
+                lease -> {
+                    if (isRejectable(lease))
+                        leaseRejectAction.call(lease);
+                };
+    }
+
+    private boolean isRejectable(VirtualMachineLease l) {
+        return l != null && l.getOffer() != null;
+    }
+
     private void addToAvailableResources(VirtualMachineLease l) {
         if(singleLeaseMode && firstLeaseAdded)
             return; // ToDo should this be illegal state exception?
         firstLeaseAdded = true;
+        final Map<String, Double> scalars = l.getScalarValues();
+        if(scalars != null && !scalars.isEmpty()) {
+            for(Map.Entry<String, Double> entry: scalars.entrySet()) {
+                Double currVal = currTotalScalars.get(entry.getKey());
+                if(currVal == null)
+                    currVal = 0.0;
+                currTotalScalars.put(entry.getKey(), currVal + entry.getValue());
+            }
+        }
         currTotalCpus += l.cpuCores();
         currTotalMemory += l.memoryMB();
         currTotalNetworkMbps += l.networkMbps();
@@ -182,8 +205,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             currPortRanges.addRanges(l.portRanges());
         if (l.getAttributeMap() != null) {
             // always replace attributes map with the latest
-            currAttributesMap.clear();
-            currAttributesMap.putAll(l.getAttributeMap());
+            currAttributesMap = Collections.unmodifiableMap(new HashMap<>(l.getAttributeMap()));
         }
         for(Map.Entry<String, Protos.Attribute> entry: currAttributesMap.entrySet()) {
             switch (entry.getKey()) {
@@ -202,7 +224,15 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
                                         try {
                                             int val0 = Integer.parseInt(val0Str);
                                             int val1 = Integer.parseInt(val1Str);
-                                            resourceSets.put(name, new PreferentialNamedConsumableResourceSet(name, val0, val1));
+                                            final PreferentialNamedConsumableResourceSet crs =
+                                                    new PreferentialNamedConsumableResourceSet(hostname, name, val0, val1);
+                                            final Iterator<TaskRequest> iterator = consumedResourcesToAssign.iterator();
+                                            while(iterator.hasNext()) {
+                                                TaskRequest request = iterator.next();
+                                                crs.assign(request);
+                                                iterator.remove();
+                                            }
+                                            resourceSets.put(name, crs);
                                         }
                                         catch (NumberFormatException e) {
                                             logger.warn(hostname + ": invalid resource spec (" + val + ") in attributes, ignoring: " + e.getMessage());
@@ -219,6 +249,10 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
                     break;
             }
         }
+        if(!consumedResourcesToAssign.isEmpty()) {
+            throw new IllegalStateException(hostname + ": Some assigned tasks have no resource sets in offers: " +
+                    consumedResourcesToAssign);
+        }
     }
 
     void updateCurrTotalLease() {
@@ -232,11 +266,13 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             currTotalNetworkMbps=0.0;
             currTotalDisk=0.0;
             currPortRanges.clear();
+            currTotalScalars.clear();
         }
         currUsedCpus=0.0;
         currUsedMemory=0.0;
         currUsedNetworkMbps=0.0;
         currUsedDisk=0.0;
+        currUsedScalars.clear();
         // ToDo: in single offer mode, need to resolve used ports somehow
         // don't clear attribute map
         for(VirtualMachineLease l: leasesMap.values())
@@ -291,12 +327,24 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             }
             @Override
             public Map<String, Protos.Attribute> getAttributeMap() {
-                return Collections.unmodifiableMap(currAttributesMap);
+                return currAttributesMap;
+            }
+            @Override
+            public Double getScalarValue(String name) {
+                return currTotalScalars.get(name);
+            }
+            @Override
+            public Map<String, Double> getScalarValues() {
+                return Collections.unmodifiableMap(currTotalScalars);
             }
         };
     }
 
     void removeExpiredLeases(boolean all) {
+        removeExpiredLeases(all, true);
+    }
+
+    void removeExpiredLeases(boolean all, boolean doRejectCallback) {
         @SuppressWarnings("MismatchedQueryAndUpdateOfCollection") Set<String> leasesToExpireIds = new HashSet<>();
         leasesToExpire.drainTo(leasesToExpireIds);
         Iterator<Map.Entry<String,VirtualMachineLease>> iterator = leasesMap.entrySet().iterator();
@@ -308,9 +356,12 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
                 if(expireAll) {
                     if(logger.isDebugEnabled())
                         logger.debug(hostname + ": expiring lease offer id " + l.getId());
-                    leaseRejectAction.call(l);
+                    if (doRejectCallback)
+                        leaseRejectAction.call(l);
                 }
                 iterator.remove();
+                if (logger.isDebugEnabled())
+                    logger.debug("Removed lease on {}, all={}", hostname, all);
             }
         }
         if(expireAll && !hasPreviouslyAssignedTasks())
@@ -320,21 +371,23 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
     int expireLimitedLeases(AssignableVMs.VMRejectLimiter vmRejectLimiter) {
         if(singleLeaseMode)
             return 0;
-        int rejected=0;
-        Iterator<Map.Entry<String,VirtualMachineLease>> iterator = leasesMap.entrySet().iterator();
         long now = System.currentTimeMillis();
-        while(iterator.hasNext()) {
-            VirtualMachineLease l = iterator.next().getValue();
-            if(l.getOfferedTime() < (now - leaseOfferExpirySecs*1000) && vmRejectLimiter.reject()) {
-                leaseIdToHostnameMap.remove(l.getId());
-                if(logger.isDebugEnabled())
-                    logger.debug(getHostname() + ": expiring lease offer id " + l.getId());
-                leaseRejectAction.call(l);
-                iterator.remove();
-                rejected++;
+        for (VirtualMachineLease l: leasesMap.values()) {
+            if (isRejectable(l) && l.getOfferedTime() < (now - leaseOfferExpirySecs * 1000) && vmRejectLimiter.reject()) {
+                for (VirtualMachineLease vml: leasesMap.values()) {
+                    leaseIdToHostnameMap.remove(vml.getId());
+                    if(logger.isDebugEnabled())
+                        logger.debug(getHostname() + ": expiring lease offer id " + l.getId());
+                    leaseRejectAction.call(vml);
+                }
+                int size = leasesMap.values().size();
+                leasesMap.clear();
+                if (logger.isDebugEnabled())
+                    logger.debug(hostname + ": cleared leases");
+                return size;
             }
         }
-        return rejected;
+        return 0;
     }
 
     String getCurrVMId() {
@@ -342,6 +395,8 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
     }
 
     boolean addLease(VirtualMachineLease lease) {
+        if (logger.isDebugEnabled())
+            logger.debug("{}: adding lease id {}", hostname, lease.getId());
         if(singleLeaseMode && firstLeaseAdded)
             return false;
         if(!Objects.equals(currVMId, lease.getVMID())) {
@@ -352,6 +407,8 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             leaseRejectAction.call(lease);
             return false;
         }
+        if (logger.isDebugEnabled())
+            logger.debug(hostname + ": adding to internal leases map");
         if(leasesMap.get(lease.getId()) != null)
             throw new IllegalStateException("Attempt to add duplicate lease with id=" + lease.getId());
         if(leaseIdToHostnameMap.putIfAbsent(lease.getId(), hostname) != null)
@@ -366,13 +423,15 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
     void setDisabledUntil(long disabledUntil) {
         this.disabledUntil = disabledUntil;
         if(logger.isDebugEnabled())
-            logger.debug(getHostname() + ": disabling for " + (disabledUntil - System.currentTimeMillis()) + " mSecs");
+            logger.debug("{}: disabling for {} mSecs", hostname, (disabledUntil - System.currentTimeMillis()));
         Iterator<Map.Entry<String, VirtualMachineLease>> entriesIterator = leasesMap.entrySet().iterator();
         while(entriesIterator.hasNext()) {
             Map.Entry<String, VirtualMachineLease> entry = entriesIterator.next();
             leaseIdToHostnameMap.remove(entry.getValue().getId());
             leaseRejectAction.call(entry.getValue());
             entriesIterator.remove();
+            if (logger.isDebugEnabled())
+                logger.debug("Removed lease on " + hostname + " due to being disabled");
         }
     }
 
@@ -387,25 +446,48 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
     boolean isActive() {
         return !leasesMap.isEmpty() ||
                 hasPreviouslyAssignedTasks() ||
+                !assignmentResults.isEmpty() ||
                 !leasesToExpire.isEmpty() ||
                 !workersToUnAssign.isEmpty() ||
                 System.currentTimeMillis() < disabledUntil;
     }
 
     boolean isAssignableNow() {
-        return (System.currentTimeMillis()>disabledUntil) && !leasesMap.isEmpty();
+        return !isDisabled() && !leasesMap.isEmpty();
+    }
+
+    boolean isDisabled() {
+        return System.currentTimeMillis() < disabledUntil;
     }
 
     void setAssignedTask(TaskRequest request) {
         if(logger.isDebugEnabled())
-            logger.debug(getHostname() + ": setting assigned task " + request.getId());
+            logger.debug("{}: setting assigned task {}", hostname, request.getId());
         boolean added = taskTracker.addRunningTask(request, this);
-        if(!added)
+        if(added) {
+            assignResourceSets(request);
+        }
+        else
             logger.error("Unexpected to add duplicate task id=" + request.getId());
         previouslyAssignedTasksMap.put(request.getId(), request);
         setIfExclusive(request);
         if(singleLeaseMode && added) {
             removeResourcesOf(request);
+        }
+    }
+
+    private void assignResourceSets(TaskRequest request) {
+        if(request.getAssignedResources() != null) {
+            final List<PreferentialNamedConsumableResourceSet.ConsumeResult> consumedNamedResources =
+                    request.getAssignedResources().getConsumedNamedResources();
+            if(consumedNamedResources != null && !consumedNamedResources.isEmpty()) {
+                for(PreferentialNamedConsumableResourceSet.ConsumeResult cr: consumedNamedResources) {
+                    if(resourceSets.get(cr.getAttrName()) == null)
+                        consumedResourcesToAssign.add(request); // resource set not available yet
+                    else
+                        resourceSets.get(cr.getAttrName()).assign(request);
+                }
+            }
         }
     }
 
@@ -443,7 +525,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         workersToUnAssign.drainTo(tasks);
         for(String t: tasks) {
             if(logger.isDebugEnabled())
-                logger.debug(getHostname() + ": removing previously assigned task " + t);
+                logger.debug("{}: removing previously assigned task {}", hostname, t);
             taskTracker.removeRunningTask(t);
             TaskRequest r = previouslyAssignedTasksMap.remove(t);
             if(singleLeaseMode && r!=null)
@@ -471,6 +553,22 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         currTotalMemory -= request.getMemory();
         currTotalDisk -= request.getDisk();
         currTotalNetworkMbps -= request.getNetworkMbps();
+        final Map<String, Double> scalarRequests = request.getScalarRequests();
+        if(scalarRequests != null && !scalarRequests.isEmpty()) {
+            for(Map.Entry<String, Double> entry: scalarRequests.entrySet()) {
+                Double oldVal = currTotalScalars.get(entry.getKey());
+                if(oldVal != null) {
+                    double newVal = oldVal - entry.getValue();
+                    if(newVal < 0.0) {
+                        logger.warn(hostname + ": Scalar resource " + entry.getKey() + " is " + newVal + " after removing " +
+                                entry.getValue() + " from task " + request.getId());
+                        currTotalScalars.put(entry.getKey(), 0.0);
+                    }
+                    else
+                        currTotalScalars.put(entry.getKey(), newVal);
+                }
+            }
+        }
         // ToDo need to figure out ports as well
     }
 
@@ -479,7 +577,16 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         currTotalMemory += r.getMemory();
         currTotalNetworkMbps += r.getNetworkMbps();
         currTotalDisk += r.getDisk();
-        // ToDo add back ports
+        final Map<String, Double> scalarRequests = r.getScalarRequests();
+        if(scalarRequests != null && !scalarRequests.isEmpty()) {
+            for(Map.Entry<String, Double> entry: scalarRequests.entrySet()) {
+                Double oldVal = currTotalScalars.get(entry.getKey());
+                if(oldVal == null)
+                    oldVal = 0.0;
+                currTotalScalars.put(entry.getKey(), oldVal + entry.getValue());
+            }
+        }
+        // ToDo queueTask back ports
     }
 
     String getAttrValue(String attrName) {
@@ -489,6 +596,29 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         if(attribute==null)
             return null;
         return attribute.getText().getValue();
+    }
+
+    Map<String, Double> getMaxScalars() {
+        Map<String, Double> result = new HashMap<>();
+        if (currTotalScalars != null) {
+            for (Map.Entry<String, Double> e : currTotalScalars.entrySet()) {
+                result.put(e.getKey(), e.getValue());
+            }
+        }
+        if (hasPreviouslyAssignedTasks()) {
+            for (TaskRequest t: previouslyAssignedTasksMap.values()) {
+                final Map<String, Double> scalarRequests = t.getScalarRequests();
+                if (scalarRequests != null && !scalarRequests.isEmpty()) {
+                    for (Map.Entry<String, Double> e: scalarRequests.entrySet()) {
+                        if (result.get(e.getKey()) == null)
+                            result.put(e.getKey(), e.getValue());
+                        else
+                            result.put(e.getKey(), e.getValue() + result.get(e.getKey()));
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     Map<VMResource, Double> getMaxResources() {
@@ -534,13 +664,13 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
      */
     TaskAssignmentResult tryRequest(TaskRequest request, VMTaskFitnessCalculator fitnessCalculator) {
         if(logger.isDebugEnabled())
-            logger.debug("Host " + getHostname() + " task " + request.getId() + ": #leases=" + leasesMap.size());
+            logger.debug("Host {} task {}: #leases: {}", getHostname(), request.getId(), leasesMap.size());
         if(leasesMap.isEmpty())
             return null;
         if(exclusiveTaskId!=null) {
             if(logger.isDebugEnabled())
-                logger.debug("Host " + getHostname() + ": can't assign task " + request.getId() + ", already have task " +
-                        exclusiveTaskId + " assigned with exclusive host constraint");
+                logger.debug("Host {}: can't assign task {}, already have task {} assigned with exclusive host constraint",
+                        hostname, request.getId(), exclusiveTaskId);
             ConstraintFailure failure = new ConstraintFailure(ExclusiveHostConstraint.class.getName(),
                     "Already has task " + exclusiveTaskId + " with exclusive host constraint");
             return new TaskAssignmentResult(this, request, false, null, failure, 0.0);
@@ -550,7 +680,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         ConstraintFailure failedHardConstraint = findFailedHardConstraints(request, vmCurrentState, taskTrackerState);
         if(failedHardConstraint!=null) {
             if(logger.isDebugEnabled())
-                logger.debug("Host " + getHostname() + ": task " + request.getId() + " failed hard constraint: " + failedHardConstraint);
+                logger.debug("Host {}: task {} failed hard constraint: ", hostname, request.getId(), failedHardConstraint);
             return new TaskAssignmentResult(this, request, false, null, failedHardConstraint, 0.0);
         }
         final ResAsgmntResult resAsgmntResult = evalAndGetResourceAssignmentFailures(request);
@@ -559,7 +689,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
                 StringBuilder b = new StringBuilder();
                 for(AssignmentFailure f: resAsgmntResult.failures)
                     b.append(f.toString()).append(" ; ");
-                logger.debug(getHostname() + ": task " + request.getId() + " failed assignment: " + b.toString());
+                logger.debug("{}: task {} failed assignment: {}", hostname, request.getId(), b.toString());
             }
             return new TaskAssignmentResult(this, request, false, resAsgmntResult.failures, null, 0.0);
         }
@@ -567,7 +697,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         double fitness = fitnessCalculator.calculateFitness(request, vmCurrentState, taskTrackerState);
         if(fitness == 0.0) {
             if(logger.isDebugEnabled())
-                logger.debug(getHostname() + ": task " + request.getId() + " fitness calculator returned 0.0");
+                logger.debug("{}: task {} fitness calculator returned 0.0", hostname, request.getId());
             List<AssignmentFailure> failures = Collections.singletonList(
                     new AssignmentFailure(VMResource.Fitness, 0.0, 0.0, 0.0, "fitnessCalculator: 0.0"));
             return new TaskAssignmentResult(this, request, false, failures, null, fitness);
@@ -602,6 +732,22 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
 
     private ResAsgmntResult evalAndGetResourceAssignmentFailures(TaskRequest request) {
         List<AssignmentFailure> failures = new ArrayList<>();
+        final Map<String, Double> scalarRequests = request.getScalarRequests();
+        if(scalarRequests != null && !scalarRequests.isEmpty()) {
+            for(Map.Entry<String, Double> entry: scalarRequests.entrySet()) {
+                if(entry.getValue() == null)
+                    continue;
+                Double u = currUsedScalars.get(entry.getKey());
+                if(u == null)  u = 0.0;
+                Double t = currTotalScalars.get(entry.getKey());
+                if(t == null)  t=0.0;
+                if(u + entry.getValue() > t) {
+                    failures.add(new AssignmentFailure(
+                            VMResource.Other, entry.getValue(), u, t, entry.getKey()
+                    ));
+                }
+            }
+        }
         if((currUsedCpus+request.getCPUs()) > currTotalCpus) {
             AssignmentFailure failure = new AssignmentFailure(
                     VMResource.CPU, request.getCPUs(), currUsedCpus,
@@ -644,7 +790,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             for (Map.Entry<String, PreferentialNamedConsumableResourceSet> entry : resourceSets.entrySet()) {
                 if (!requestedNamedResNames.isEmpty())
                     requestedNamedResNames.remove(entry.getKey());
-                final double fitness = entry.getValue().getFitness(request);
+                final double fitness = entry.getValue().getFitness(request, preferentialNamedConsumableResourceEvaluator);
                 if (fitness == 0.0) {
                     AssignmentFailure failure = new AssignmentFailure(VMResource.ResourceSet, 0.0, 0.0, 0.0,
                             "ResourceSet " + entry.getValue().getName() + " unavailable"
@@ -686,6 +832,10 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
     }
 
     VirtualMachineCurrentState getVmCurrentState() {
+        final List<Protos.Offer> offers = new LinkedList<>();
+        for (VirtualMachineLease l: leasesMap.values()) {
+            offers.add(l.getOffer());
+        }
         return new VirtualMachineCurrentState() {
             @Override
             public String getHostname() {
@@ -699,6 +849,13 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             public VirtualMachineLease getCurrAvailableResources() {
                 return currTotalLease;
             }
+
+            @Override
+            public Collection<Protos.Offer> getAllCurrentOffers() {
+                System.out.println("****************************** ");
+                return offers;
+            }
+
             @Override
             public Collection<TaskAssignmentResult> getTasksCurrentlyAssigned() {
                 return Collections.emptyList();
@@ -707,10 +864,18 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             public Collection<TaskRequest> getRunningTasks() {
                 return Collections.unmodifiableCollection(previouslyAssignedTasksMap.values());
             }
+            @Override
+            public long getDisabledUntil() {
+                return disabledUntil;
+            }
         };
     }
 
     private VirtualMachineCurrentState vmCurrentState() {
+        final List<Protos.Offer> offers = new LinkedList<>();
+        for (VirtualMachineLease l: leasesMap.values()) {
+            offers.add(l.getOffer());
+        }
         return new VirtualMachineCurrentState() {
             @Override
             public String getHostname() {
@@ -724,6 +889,12 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             public VirtualMachineLease getCurrAvailableResources() {
                 return currTotalLease;
             }
+
+            @Override
+            public Collection<Protos.Offer> getAllCurrentOffers() {
+                return offers;
+            }
+
             @Override
             public Collection<TaskAssignmentResult> getTasksCurrentlyAssigned() {
                 return Collections.unmodifiableCollection(assignmentResults.values());
@@ -731,6 +902,10 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             @Override
             public Collection<TaskRequest> getRunningTasks() {
                 return Collections.unmodifiableCollection(previouslyAssignedTasksMap.values());
+            }
+            @Override
+            public long getDisabledUntil() {
+                return disabledUntil;
             }
         };
     }
@@ -762,6 +937,16 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
      * @param result The assignment result to assign.
      */
     void assignResult(TaskAssignmentResult result) {
+        final Map<String, Double> scalarRequests = result.getRequest().getScalarRequests();
+        if(scalarRequests != null && !scalarRequests.isEmpty()) {
+            for(Map.Entry<String, Double> entry: scalarRequests.entrySet()) {
+                if(entry.getValue() == null)
+                    continue;
+                Double u = currUsedScalars.get(entry.getKey());
+                if(u == null)  u = 0.0;
+                currUsedScalars.put(entry.getKey(), u + entry.getValue());
+            }
+        }
         currUsedCpus += result.getRequest().getCPUs();
         currUsedMemory += result.getRequest().getMemory();
         currUsedNetworkMbps += result.getRequest().getNetworkMbps();
@@ -770,7 +955,7 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
             result.addPort(currPortRanges.consumeNextPort());
         }
         for(Map.Entry<String, PreferentialNamedConsumableResourceSet> entry: resourceSets.entrySet()) {
-            result.addResourceSet(entry.getValue().consume(result.getRequest()));
+            result.addResourceSet(entry.getValue().consume(result.getRequest(), preferentialNamedConsumableResourceEvaluator));
         }
         if(!taskTracker.addAssignedTask(result.getRequest(), this))
             logger.error("Unexpected to re-add task to assigned state, id=" + result.getRequest().getId());
@@ -828,27 +1013,32 @@ class AssignableVirtualMachine implements Comparable<AssignableVirtualMachine>{
         double memUsed=0.0;
         double portsUsed=0.0;
         double networkUsed=0.0;
+        double diskUsed=0.0;
         for(TaskRequest r: previouslyAssignedTasksMap.values()) {
             cpusUsed += r.getCPUs();
             memUsed += r.getMemory();
             portsUsed += r.getPorts();
             networkUsed += r.getNetworkMbps();
+            diskUsed += r.getDisk();
         }
         double cpusAvail=0.0;
         double memAvail=0.0;
         double portsAvail=0;
         double networkAvail=0.0;
+        double diskAvail=0.0;
         for(VirtualMachineLease l: leasesMap.values()) {
             cpusAvail += l.cpuCores();
             memAvail += l.memoryMB();
             for(VirtualMachineLease.Range range: l.portRanges())
                 portsAvail += range.getEnd()-range.getBeg();
             networkAvail += l.networkMbps();
+            diskAvail += l.diskMB();
         }
         resourceMap.put(VMResource.CPU, new Double[]{cpusUsed, cpusAvail});
         resourceMap.put(VMResource.Memory, new Double[]{memUsed, memAvail});
         resourceMap.put(VMResource.Ports, new Double[]{portsUsed, portsAvail});
         resourceMap.put(VMResource.Network, new Double[]{networkUsed, networkAvail});
+        resourceMap.put(VMResource.Disk, new Double[]{diskUsed, diskAvail});
         // put resource sets
         for(PreferentialNamedConsumableResourceSet rSet: resourceSets.values()) {
             final String name = rSet.getName();

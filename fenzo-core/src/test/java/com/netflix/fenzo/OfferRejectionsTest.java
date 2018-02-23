@@ -18,13 +18,10 @@ package com.netflix.fenzo;
 
 import com.netflix.fenzo.functions.Action1;
 import com.netflix.fenzo.functions.Func1;
-import junit.framework.Assert;
+import org.junit.Assert;
 import org.junit.Test;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -32,6 +29,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class OfferRejectionsTest {
@@ -198,7 +196,7 @@ public class OfferRejectionsTest {
     @Test
     public void testTimedOfferRejects() throws Exception {
         final AtomicInteger expireCount = new AtomicInteger();
-        final int leaseExpirySecs=3;
+        final int leaseExpirySecs=2;
         final TaskScheduler scheduler = new TaskScheduler.Builder()
                 .withLeaseRejectAction(new Action1<VirtualMachineLease>() {
                     @Override
@@ -216,7 +214,7 @@ public class OfferRejectionsTest {
             leases.clear();
             Thread.sleep(1000);
         }
-        leases = LeaseProvider.getLeases(nLeases, 4, 4000, 1, 10);
+        leases = LeaseProvider.getLeases(nLeases, nLeases, 4, 4000, 1, 10);
         for(int i=0; i<leaseExpirySecs-1; i++) {
             scheduler.scheduleOnce(Collections.<TaskRequest>emptyList(), leases);
             leases.clear();
@@ -229,5 +227,35 @@ public class OfferRejectionsTest {
             Thread.sleep(1000);
         }
         Assert.assertEquals(nLeases*2, expireCount.get());
+    }
+
+    // test that all offers of a VM are rejected when one of them expires
+    @Test
+    public void testRejectAllOffersOfVm() throws Exception {
+        final AtomicInteger expireCount = new AtomicInteger();
+        final int leaseExpirySecs=2;
+        final Set<String> hostsRejectedFrom = new HashSet<>();
+        final AtomicBoolean gotReject = new AtomicBoolean();
+        final TaskScheduler scheduler = new TaskScheduler.Builder()
+                .withLeaseRejectAction(virtualMachineLease -> {
+                    expireCount.incrementAndGet();
+                    hostsRejectedFrom.add(virtualMachineLease.hostname());
+                    gotReject.set(true);
+                })
+                .withLeaseOfferExpirySecs(leaseExpirySecs)
+                .withMaxOffersToReject(1)
+                .build();
+        final int nhosts = 2;
+        List<VirtualMachineLease> leases = LeaseProvider.getLeases(nhosts, 4, 4000, 1, 10);
+        // add the same leases with same hostnames twice again, so there are 3 offers for each of the nHosts.
+        leases.addAll(LeaseProvider.getLeases(nhosts, 4, 4000, 1, 10));
+        leases.addAll(LeaseProvider.getLeases(nhosts, 4, 4000, 1, 10));
+        for (int i=0; i<leaseExpirySecs+2 && !gotReject.get(); i++) {
+            scheduler.scheduleOnce(Collections.<TaskRequest>emptyList(), leases);
+            leases.clear();
+            Thread.sleep(1000);
+        }
+        Assert.assertEquals(3, expireCount.get());
+        Assert.assertEquals(1, hostsRejectedFrom.size());
     }
 }

@@ -16,6 +16,8 @@
 
 package com.netflix.fenzo;
 
+import org.apache.mesos.Protos;
+
 import java.util.Collection;
 import java.util.Map;
 
@@ -49,6 +51,13 @@ public interface VirtualMachineCurrentState {
     VirtualMachineLease getCurrAvailableResources();
 
     /**
+     * Get all offers for the VM that represent the available resources. There may be more than one offer over time
+     * if Mesos master offered partial resources for the VM multiple times.
+     * @return A collection of Mesos resource offers.
+     */
+    Collection<Protos.Offer> getAllCurrentOffers();
+
+    /**
      * Get list of task assignment results for this host so far in the current scheduling run.
      *
      * @return a collection of tasks that the current scheduling iteration assigned to this host but that are
@@ -63,4 +72,11 @@ public interface VirtualMachineCurrentState {
      * @return a collection of the tasks running on this host
      */
     Collection<TaskRequest> getRunningTasks();
+
+    /**
+     * Returns the time until which the given host remains disabled.
+     *
+     * @return time until which the host will remain disabled or 0 if the host is enabled
+     */
+    long getDisabledUntil();
 }

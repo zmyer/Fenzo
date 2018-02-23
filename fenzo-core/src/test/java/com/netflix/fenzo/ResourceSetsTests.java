@@ -19,7 +19,7 @@ package com.netflix.fenzo;
 import com.netflix.fenzo.functions.Action1;
 import com.netflix.fenzo.functions.Func1;
 import com.netflix.fenzo.plugins.BinPackingFitnessCalculators;
-import junit.framework.Assert;
+import org.junit.Assert;
 import org.apache.mesos.Protos;
 import org.junit.Test;
 
@@ -30,9 +30,9 @@ public class ResourceSetsTests {
 
     private static final String resSetsAttrName = "res";
     static String hostAttrName = "MachineType";
-    final String hostAttrVal1="4coreServers";
+    static final String hostAttrVal1="4coreServers";
 
-    private Map<String, Protos.Attribute> getResSetsAttributesMap(String name, int x, int y) {
+    static Map<String, Protos.Attribute> getResSetsAttributesMap(String name, int x, int y) {
         Map<String, Protos.Attribute> attr = new HashMap<>();
         attr.put(
                 resSetsAttrName,
@@ -336,13 +336,14 @@ public class ResourceSetsTests {
     }
 
     // Test that an initialization of scheduler with tasks assigned from before does the right thing for next scheduling
-    // iteration. Create a host with 3 resource sets, each with 2 sub-resources. Initialize scheduler with two tasks
-    // already assigned from before. One of the two tasks requests resource set sr1 and the other one asks for sr2, each
-    // with one sub-resource.
-    // Now schedule 1 task asking for sr1 with 1 sub-resource. It should get assigned.
-    // Then schedule 1 task asking for sr3 with 1 sub-resource each. It should get assigned.
-    // Then submit 2 tasks, one of them asking for sr1 and another sr3. The former should fail assignment and the latter
-    // should get assigned.
+    // iteration. Create a host with 3 resource sets, each with 2 sub-resources. Initialize scheduler with three tasks
+    // already assigned from before. Each task asks for 1 sub-resource. Task 1 requests resource set sr1 and was assigned
+    // on set 0. Task 2 requests resource set sr1 and was assigned on set 1. Task 3 requests resource set sr2 and was
+    // assigned on set 2.
+    // Now schedule 2 tasks, one asking for sr1 and another for sr3. The first task should get assigned and the second
+    // one should not.
+    // Then schedule another 2 tasks, one asking for sr2 and another asking sr3. The first task should get assigned
+    // and the second task should not.
     @Test
     public void testInitingSchedulerWithPreviousTasks() throws Exception {
         int numCores=4;
@@ -356,23 +357,59 @@ public class ResourceSetsTests {
         TaskRequest.NamedResourceSetRequest sr1 = new TaskRequest.NamedResourceSetRequest("ENIs", "sg1", 1, 1);
         TaskRequest.NamedResourceSetRequest sr2 = new TaskRequest.NamedResourceSetRequest("ENIs", "sg2", 1, 1);
         TaskRequest.NamedResourceSetRequest sr3 = new TaskRequest.NamedResourceSetRequest("ENIs", "sg3", 1, 1);
-        // create two tasks, one asking for sr1 and another asking sr2
+        // create three tasks, two asking for sr1 and another one asking sr2
         final TaskRequest task1 = TaskRequestProvider.getTaskRequest(
                 "grp", 0.1, 100, 0, 0, 0, null, null, Collections.singletonMap(sr1.getResName(), sr1));
+        final TaskRequest.AssignedResources ar1 = new TaskRequest.AssignedResources();
+        ar1.setConsumedNamedResources(Collections.singletonList(
+                new PreferentialNamedConsumableResourceSet.ConsumeResult(0, "ENIs", "sg1", 1.0)
+        ));
+        task1.setAssignedResources(ar1);
         final TaskRequest task2 = TaskRequestProvider.getTaskRequest(
+                "grp", 0.1, 100, 0, 0, 0, null, null, Collections.singletonMap(sr1.getResName(), sr1));
+        final TaskRequest.AssignedResources ar2 = new TaskRequest.AssignedResources();
+        ar2.setConsumedNamedResources(Collections.singletonList(
+                new PreferentialNamedConsumableResourceSet.ConsumeResult(1, "ENIs", "sg1", 1.0)
+        ));
+        task2.setAssignedResources(ar2);
+        final TaskRequest task3 = TaskRequestProvider.getTaskRequest(
                 "grp", 0.1, 100, 0, 0, 0, null, null, Collections.singletonMap(sr2.getResName(), sr2));
+        final TaskRequest.AssignedResources ar3 = new TaskRequest.AssignedResources();
+        ar3.setConsumedNamedResources(Collections.singletonList(
+                new PreferentialNamedConsumableResourceSet.ConsumeResult(2, "ENIs", "sg2", 1.0)
+        ));
+        task3.setAssignedResources(ar3);
         final TaskScheduler taskScheduler = getTaskScheduler();
         taskScheduler.getTaskAssigner().call(task1, "hostA");
         taskScheduler.getTaskAssigner().call(task2, "hostA");
+        taskScheduler.getTaskAssigner().call(task3, "hostA");
         List<TaskRequest> tasks = new ArrayList<>();
         tasks.add(TaskRequestProvider.getTaskRequest(
                 "grp", 0.1, 100, 0, 0, 0, null, null, Collections.singletonMap(sr1.getResName(), sr1)));
         tasks.add(TaskRequestProvider.getTaskRequest(
                 "grp", 0.1, 100, 0, 0, 0, null, null, Collections.singletonMap(sr3.getResName(), sr3)));
         SchedulingResult result = taskScheduler.scheduleOnce(tasks, leases);
-        Assert.assertEquals(0, result.getFailures().size());
+        Assert.assertEquals(1, result.getFailures().size());
         Assert.assertEquals(1, result.getResultMap().size());
-        Assert.assertEquals(2, result.getResultMap().values().iterator().next().getTasksAssigned().size());
+        Assert.assertEquals(1, result.getResultMap().values().iterator().next().getTasksAssigned().size());
+        TaskAssignmentResult assignmentResult =
+                result.getResultMap().values().iterator().next().getTasksAssigned().iterator().next();
+        Assert.assertEquals("sg1", assignmentResult.getRequest().getCustomNamedResources().values().iterator().next().getResValue());
+        taskScheduler.getTaskAssigner().call(assignmentResult.getRequest(), "hostA");
+        tasks.clear();
+        leases.clear();
+        leases.add(LeaseProvider.getConsumedLease(result.getResultMap().values().iterator().next()));
+        tasks.add(TaskRequestProvider.getTaskRequest(
+                "grp", 0.1, 100, 0, 0, 0, null, null, Collections.singletonMap(sr2.getResName(), sr2)));
+        tasks.add(TaskRequestProvider.getTaskRequest(
+                "grp", 0.1, 100, 0, 0, 0, null, null, Collections.singletonMap(sr3.getResName(), sr3)));
+        result = taskScheduler.scheduleOnce(tasks, leases);
+        Assert.assertEquals(1, result.getFailures().size());
+        Assert.assertEquals(1, result.getResultMap().size());
+        Assert.assertEquals(1, result.getResultMap().values().iterator().next().getTasksAssigned().size());
+        assignmentResult =
+                result.getResultMap().values().iterator().next().getTasksAssigned().iterator().next();
+        Assert.assertEquals("sg2", assignmentResult.getRequest().getCustomNamedResources().values().iterator().next().getResValue());
     }
 
     // Test that when resource sets are unavailable on one host, they are assigned on another host
@@ -438,6 +475,7 @@ public class ResourceSetsTests {
             taskScheduler.getTaskAssigner().call(r.getRequest(), r.getHostname());
             taskId = r.getTaskId();
         }
+        Assert.assertEquals(tasks.size(), tasksAssigned);
         tasks.clear();
         tasks.add(TaskRequestProvider.getTaskRequest(
                 "grp", 0.1, 100, 0, 0, 0, null, null, Collections.singletonMap(sr2.getResName(), sr2)));
@@ -654,11 +692,11 @@ public class ResourceSetsTests {
         scheduler.scheduleOnce(tasks, leases);
         final Map<VMResource, Double[]> usage = scheduler.getResourceStatus().get("hostA");
         final Double[] cpuUsg = usage.get(VMResource.CPU);
-        Assert.assertEquals(0.2, cpuUsg[0]);
-        Assert.assertEquals(numCores - 0.2, cpuUsg[1]);
+        Assert.assertTrue(0.2 == cpuUsg[0]);
+        Assert.assertTrue(numCores - 0.2 == cpuUsg[1]);
         final Double[] rSetUsg = usage.get(VMResource.ResourceSet);
-        Assert.assertEquals(2.0, rSetUsg[0]);
-        Assert.assertEquals(1.0, rSetUsg[1]);
+        Assert.assertTrue(2.0 == rSetUsg[0]);
+        Assert.assertTrue(1.0 == rSetUsg[1]);
     }
 
     // Test that a task asking for a resource set that doesn't exist does not get assigned

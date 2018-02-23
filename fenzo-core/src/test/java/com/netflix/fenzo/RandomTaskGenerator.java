@@ -57,6 +57,7 @@ public class RandomTaskGenerator {
         private final long runUntilMillis;
         private final long runtimeMillis;
         private String hostname;
+        private AssignedResources assignedResources=null;
         public GeneratedTask(final TaskRequest taskRequest, final long runtimeMillis, final long runUntilMillis) {
             this.taskRequest = taskRequest;
             this.runUntilMillis = runUntilMillis;
@@ -98,6 +99,12 @@ public class RandomTaskGenerator {
         public int getPorts() {
             return taskRequest.getPorts();
         }
+
+        @Override
+        public Map<String, Double> getScalarRequests() {
+            return null;
+        }
+
         @Override
         public List<? extends ConstraintEvaluator> getHardConstraints() {
             return taskRequest.getHardConstraints();
@@ -106,6 +113,15 @@ public class RandomTaskGenerator {
         public List<? extends VMTaskFitnessCalculator> getSoftConstraints() {
             return taskRequest.getSoftConstraints();
         }
+        @Override
+        public void setAssignedResources(AssignedResources assignedResources) {
+            this.assignedResources = assignedResources;
+        }
+        @Override
+        public AssignedResources getAssignedResources() {
+            return assignedResources;
+        }
+
         @Override
         public Map<String, NamedResourceSetRequest> getCustomNamedResources() {
             return Collections.emptyMap();

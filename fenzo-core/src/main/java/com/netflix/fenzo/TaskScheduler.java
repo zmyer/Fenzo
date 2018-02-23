@@ -16,6 +16,9 @@
 
 package com.netflix.fenzo;
 
+import com.netflix.fenzo.plugins.NoOpScaleDownOrderEvaluator;
+import com.netflix.fenzo.queues.Assignable;
+import com.netflix.fenzo.queues.QueuableTask;
 import com.netflix.fenzo.sla.ResAllocs;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,14 +26,7 @@ import com.netflix.fenzo.functions.Action1;
 import com.netflix.fenzo.functions.Action2;
 import com.netflix.fenzo.functions.Func1;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
@@ -40,6 +36,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 /**
  * A scheduling service that you can use to optimize the assignment of tasks to hosts within a Mesos framework.
@@ -58,7 +55,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@link #getTaskUnAssigner getTaskUnAssigner()} method. These actions make the {@code TaskScheduler} keep
  * track of launched tasks. The {@code TaskScheduler} then makes these tracked tasks available to its
  * scheduling optimization functions.
- * </ol>
+ *
  * Do not call the scheduler concurrently. The scheduler assigns tasks in the order that they are received in a
  * particular list. It checks each task against available resources until it finds a match.
  * <p>
@@ -87,9 +84,13 @@ public class TaskScheduler {
         private String autoScaleByAttributeName=null;
         private String autoScalerMapHostnameAttributeName=null;
         private String autoScaleDownBalancedByAttributeName=null;
+        private ScaleDownOrderEvaluator scaleDownOrderEvaluator;
+        private Map<ScaleDownConstraintEvaluator, Double> weightedScaleDownConstraintEvaluators;
+        private PreferentialNamedConsumableResourceEvaluator preferentialNamedConsumableResourceEvaluator = new DefaultPreferentialNamedConsumableResourceEvaluator();
         private Action1<AutoScaleAction> autoscalerCallback=null;
         private long delayAutoscaleUpBySecs=0L;
         private long delayAutoscaleDownBySecs=0L;
+        private long disabledVmDurationInSecs =0L;
         private List<AutoScaleRule> autoScaleRules=new ArrayList<>();
         private Func1<Double, Boolean> isFitnessGoodEnoughFunction = new Func1<Double, Boolean>() {
             @Override
@@ -100,6 +101,8 @@ public class TaskScheduler {
         private boolean disableShortfallEvaluation=false;
         private Map<String, ResAllocs> resAllocs=null;
         private boolean singleOfferMode=false;
+        private final List<SchedulingEventListener> schedulingEventListeners = new ArrayList<>();
+        private int maxConcurrent = Runtime.getRuntime().availableProcessors();
 
         /**
          * (Required) Call this method to establish a method that your task scheduler will call to notify you
@@ -133,8 +136,8 @@ public class TaskScheduler {
         /**
          * Call this method to set the maximum number of offers to reject within a time period equal to lease expiry
          * seconds, set with {@code leaseOfferExpirySecs()}. Default is 4.
-         * @param maxOffersToReject
-         * @return
+         * @param maxOffersToReject Maximum number of offers to reject.
+         * @return this same {@code Builder}, suitable for further chaining or to build the {@link TaskScheduler}
          */
         public Builder withMaxOffersToReject(int maxOffersToReject) {
             if(!rejectAllExpiredOffers)
@@ -146,7 +149,7 @@ public class TaskScheduler {
          * Indicate that all offers older than the set expiry time must be rejected. By default this is set to false.
          * If false, Fenzo rejects a maximum number of offers set using {@link #withMaxOffersToReject(int)} per each
          * time period spanning the expiry time, set by {@link #withLeaseOfferExpirySecs(long)}.
-         * @return
+         * @return this same {@code Builder}, suitable for further chaining or to build the {@link TaskScheduler}
          */
         public Builder withRejectAllExpiredOffers() {
             this.rejectAllExpiredOffers = true;
@@ -165,6 +168,11 @@ public class TaskScheduler {
          */
         public Builder withFitnessCalculator(VMTaskFitnessCalculator fitnessCalculator) {
             this.fitnessCalculator = fitnessCalculator;
+            return this;
+        }
+
+        public Builder withSchedulingEventListener(SchedulingEventListener schedulingEventListener) {
+            this.schedulingEventListeners.add(schedulingEventListener);
             return this;
         }
 
@@ -212,6 +220,33 @@ public class TaskScheduler {
          */
         public Builder withAutoScaleDownBalancedByAttributeName(String name) {
             this.autoScaleDownBalancedByAttributeName = name;
+            return this;
+        }
+
+        /**
+         * Call this method to set {@link ScaleDownOrderEvaluator}.
+         *
+         * @param scaleDownOrderEvaluator scale down ordering evaluator
+         * @return this same {@code Builder}, suitable for further chaining or to build the {@link TaskScheduler}
+         */
+        public Builder withScaleDownOrderEvaluator(ScaleDownOrderEvaluator scaleDownOrderEvaluator) {
+            this.scaleDownOrderEvaluator = scaleDownOrderEvaluator;
+            return this;
+        }
+
+        /**
+         * Ordered list of scale down constraints evaluators.
+         *
+         * @param weightedScaleDownConstraintEvaluators scale down evaluators
+         * @return this same {@code Builder}, suitable for further chaining or to build the {@link TaskScheduler}
+         */
+        public Builder withWeightedScaleDownConstraintEvaluators(Map<ScaleDownConstraintEvaluator, Double> weightedScaleDownConstraintEvaluators) {
+            this.weightedScaleDownConstraintEvaluators = weightedScaleDownConstraintEvaluators;
+            return this;
+        }
+
+        public Builder withPreferentialNamedConsumableResourceEvaluator(PreferentialNamedConsumableResourceEvaluator preferentialNamedConsumableResourceEvaluator) {
+            this.preferentialNamedConsumableResourceEvaluator = preferentialNamedConsumableResourceEvaluator;
             return this;
         }
 
@@ -356,6 +391,27 @@ public class TaskScheduler {
         }
 
         /**
+         * How long to disable a VM when going through a scale down action. Note that the value used will be the max
+         * between this value and the {@link AutoScaleRule#getCoolDownSecs()} value and that this value should be
+         * greater than the {@link AutoScaleRule#getCoolDownSecs()} value. If the supplied {@link AutoScaleAction}
+         * does not actually terminate the instance in this time frame then the VM will become enabled. This option is useful
+         * when you want to increase the disabled time of a VM because the implementation of the {@link AutoScaleAction} may
+         * take longer than the cooldown period.
+         *
+         * @param disabledVmDurationInSecs Disable VMs about to be terminated by this many seconds.
+         * @return this same {@code Builder}, suitable for further chaining or to build the {@link TaskScheduler}
+         * @throws IllegalArgumentException if {@code disabledVmDurationInSecs} is not greater than 0.
+         * @see <a href="https://github.com/Netflix/Fenzo/wiki/Autoscaling">Autoscaling</a>
+         */
+        public Builder withAutoscaleDisabledVmDurationInSecs(long disabledVmDurationInSecs) {
+            if(disabledVmDurationInSecs <= 0L) {
+                throw new IllegalArgumentException("disabledVmDurationInSecs must be greater than 0: " + disabledVmDurationInSecs);
+            }
+            this.disabledVmDurationInSecs = disabledVmDurationInSecs;
+            return this;
+        }
+
+        /**
          * Indicate that the cluster receives resource offers only once per VM (host). Normally, Mesos sends resource
          * offers multiple times, as resources free up on the host upon completion of various tasks. This method
          * provides an experimental support for a mode where Fenzo can be made aware of the entire set of resources
@@ -372,11 +428,36 @@ public class TaskScheduler {
         }
 
         /**
+         * Fenzo creates multiple threads to speed up task placement evaluation. By default the number of threads
+         * created is equal to the number of available CPUs. As the computation cost is a multiplication of
+         * (scheduling_loop_rate * number_of_agents * number_of_tasks_in_queue), having a large agent fleet with
+         * an accumulated unscheduled workload may easily saturate all available CPUs, affecting the whole system
+         * performance. To avoid this, it is recommended to configure Fenzo with a fewer amount of threads.
+         *
+         * @param maxConcurrent maximum number of threads Fenzo is allowed to use
+         * @return this same {@code Builder}, suitable for further chaining or to build the {@link TaskScheduler}
+         */
+        public Builder withMaxConcurrent(int maxConcurrent) {
+            this.maxConcurrent = maxConcurrent;
+            return this;
+        }
+
+        /**
          * Creates a {@link TaskScheduler} based on the various builder methods you have chained.
          *
          * @return a {@code TaskScheduler} built according to the specifications you indicated
          */
         public TaskScheduler build() {
+            if(scaleDownOrderEvaluator == null) {
+                if(weightedScaleDownConstraintEvaluators != null) {
+                    scaleDownOrderEvaluator = new NoOpScaleDownOrderEvaluator();
+                }
+            } else {
+                if(weightedScaleDownConstraintEvaluators == null) {
+                    weightedScaleDownConstraintEvaluators = Collections.emptyMap();
+                }
+            }
+
             return new TaskScheduler(this);
         }
     }
@@ -401,41 +482,54 @@ public class TaskScheduler {
     private long lastVMPurgeAt=System.currentTimeMillis();
     private final Builder builder;
     private final StateMonitor stateMonitor;
+    private final SchedulingEventListener schedulingEventListener;
     private final AutoScaler autoScaler;
-    private final int EXEC_SVC_THREADS=Runtime.getRuntime().availableProcessors();
-    private final ExecutorService executorService = Executors.newFixedThreadPool(EXEC_SVC_THREADS);
+    private final int maxConcurrent;
+    private final ExecutorService executorService;
     private final AtomicBoolean isShutdown = new AtomicBoolean();
     private final ResAllocsEvaluater resAllocsEvaluator;
+    private final TaskTracker taskTracker;
+    private volatile boolean usingSchedulingService = false;
+    private final String usingSchedSvcMesg = "Invalid call when using task scheduling service";
 
     private TaskScheduler(Builder builder) {
         if(builder.leaseRejectAction ==null)
             throw new IllegalArgumentException("Lease reject action must be non-null");
         this.builder = builder;
+        this.maxConcurrent = builder.maxConcurrent;
+        this.executorService = Executors.newFixedThreadPool(maxConcurrent);
         this.stateMonitor = new StateMonitor();
-        TaskTracker taskTracker = new TaskTracker();
+        this.schedulingEventListener = CompositeSchedulingEventListener.of(builder.schedulingEventListeners);
+        taskTracker = new TaskTracker();
         resAllocsEvaluator = new ResAllocsEvaluater(taskTracker, builder.resAllocs);
-        assignableVMs = new AssignableVMs(taskTracker, builder.leaseRejectAction,
+        assignableVMs = new AssignableVMs(taskTracker, builder.leaseRejectAction, builder.preferentialNamedConsumableResourceEvaluator,
                 builder.leaseOfferExpirySecs, builder.maxOffersToReject, builder.autoScaleByAttributeName,
-                builder.singleOfferMode);
+                builder.singleOfferMode, builder.autoScaleByAttributeName);
         if(builder.autoScaleByAttributeName != null && !builder.autoScaleByAttributeName.isEmpty()) {
 
+            ScaleDownConstraintExecutor scaleDownConstraintExecutor = builder.scaleDownOrderEvaluator == null
+                    ? null : new ScaleDownConstraintExecutor(builder.scaleDownOrderEvaluator, builder.weightedScaleDownConstraintEvaluators);
             autoScaler = new AutoScaler(builder.autoScaleByAttributeName, builder.autoScalerMapHostnameAttributeName,
                     builder.autoScaleDownBalancedByAttributeName,
-                    builder.autoScaleRules, assignableVMs, null,
-                    builder.disableShortfallEvaluation, assignableVMs.getActiveVmGroups());
+                    builder.autoScaleRules, assignableVMs,
+                    builder.disableShortfallEvaluation, assignableVMs.getActiveVmGroups(),
+                    assignableVMs.getVmCollection(), scaleDownConstraintExecutor);
             if(builder.autoscalerCallback != null)
                 autoScaler.setCallback(builder.autoscalerCallback);
             if(builder.delayAutoscaleDownBySecs > 0L)
                 autoScaler.setDelayScaleDownBySecs(builder.delayAutoscaleDownBySecs);
             if(builder.delayAutoscaleUpBySecs > 0L)
                 autoScaler.setDelayScaleUpBySecs(builder.delayAutoscaleUpBySecs);
+            if (builder.disabledVmDurationInSecs > 0L) {
+                autoScaler.setDisabledVmDurationInSecs(builder.disabledVmDurationInSecs);
+            }
         }
         else {
             autoScaler=null;
         }
     }
 
-    private void checkIfShutdown() throws IllegalStateException {
+    void checkIfShutdown() throws IllegalStateException {
         if(isShutdown.get())
             throw new IllegalStateException("TaskScheduler already shutdown");
     }
@@ -457,6 +551,10 @@ public class TaskScheduler {
         autoScaler.setCallback(callback);
     }
 
+    public TaskTracker getTaskTracker() {
+        return taskTracker;
+    }
+
     private TaskAssignmentResult getSuccessfulResult(List<TaskAssignmentResult> results) {
         double bestFitness=0.0;
         TaskAssignmentResult bestResult=null;
@@ -464,7 +562,8 @@ public class TaskScheduler {
             // change to using fitness value from assignment result
             TaskAssignmentResult res = results.get(r);
             if(res!=null && res.isSuccessful()) {
-                if(bestResult==null || res.getFitness()>bestFitness) {
+                if(bestResult==null || res.getFitness()>bestFitness ||
+                        (res.getFitness()==bestFitness && res.getHostname().compareTo(bestResult.getHostname())<0)) {
                     bestFitness = res.getFitness();
                     bestResult = res;
                 }
@@ -543,6 +642,19 @@ public class TaskScheduler {
         autoScaler.removeRule(ruleName);
     }
 
+    /* package */ void setUsingSchedulingService(boolean b) {
+        usingSchedulingService = b;
+    }
+
+    /* package */ void setTaskToClusterAutoScalerMapGetter(Func1<QueuableTask, List<String>> getter) {
+        if (autoScaler != null)
+            autoScaler.setTaskToClustersGetter(getter);
+    }
+
+    /* package */ AutoScaler getAutoScaler() {
+        return autoScaler;
+    }
+
     /**
      * Schedule a list of task requests by using any newly-added resource leases in addition to any
      * previously-unused leases. This is the main scheduling method that attempts to assign resources to task
@@ -580,8 +692,41 @@ public class TaskScheduler {
      *     <li>This method may throw {@code IllegalStateException} with its cause set to the uncaught exception. In this
      *     case the internal state of Fenzo will be undefined.</li>
      * </UL>
-     * 
+     * If there are exceptions, the internal state of Fenzo may be corrupt with no way to undo any partial effects.
+     *
      * @param requests a list of task requests to match with resources, in their given order
+     * @param newLeases new resource leases from hosts that the scheduler can use along with any previously
+     *                  ununsed leases
+     * @return a {@link SchedulingResult} object that contains a task assignment results map and other summaries
+     * @throws IllegalStateException if you call this method concurrently, or, if you try to add an existing lease
+     * again, or, if there was unexpected exception during the scheduling iteration, or, if using
+     * {@link TaskSchedulingService}, which will instead invoke scheduling from within. Unexpected exceptions
+     * can arise from uncaught exceptions in user defined plugins. It is also thrown if the scheduler has been shutdown
+     * via the {@link #shutdown()} method.
+     */
+    public SchedulingResult scheduleOnce(
+            List<? extends TaskRequest> requests,
+            List<VirtualMachineLease> newLeases) throws IllegalStateException {
+        if (usingSchedulingService)
+            throw new IllegalStateException(usingSchedSvcMesg);
+        final Iterator<? extends TaskRequest> iterator =
+                requests != null ?
+                        requests.iterator() :
+                        Collections.<TaskRequest>emptyIterator();
+        TaskIterator taskIterator = new TaskIterator() {
+            @Override
+            public Assignable<TaskRequest> next() {
+                if (iterator.hasNext())
+                    return Assignable.success(iterator.next());
+                return null;
+            }
+        };
+        return scheduleOnce(taskIterator, newLeases);
+    }
+
+    /**
+     * Variant of {@link #scheduleOnce(List, List)} that takes a task iterator instead of task list.
+     * @param taskIterator Iterator for tasks to assign resources to.
      * @param newLeases new resource leases from hosts that the scheduler can use along with any previously
      *                  ununsed leases
      * @return a {@link SchedulingResult} object that contains a task assignment results map and other summaries
@@ -590,21 +735,12 @@ public class TaskScheduler {
      * can arise from uncaught exceptions in user defined plugins. It is also thrown if the scheduler has been shutdown
      * via the {@link #shutdown()} method.
      */
-    public SchedulingResult scheduleOnce(
-            List<? extends TaskRequest> requests,
+    /* package */ SchedulingResult scheduleOnce(
+            TaskIterator taskIterator,
             List<VirtualMachineLease> newLeases) throws IllegalStateException {
         checkIfShutdown();
-        try (AutoCloseable
-                     ac = stateMonitor.enter()) {
-            long start = System.currentTimeMillis();
-            final SchedulingResult schedulingResult = doSchedule(requests, newLeases);
-            if((lastVMPurgeAt + purgeVMsIntervalSecs*1000) < System.currentTimeMillis()) {
-                lastVMPurgeAt = System.currentTimeMillis();
-                logger.info("Purging inactive VMs");
-                assignableVMs.purgeInactiveVMs();
-            }
-            schedulingResult.setRuntime(System.currentTimeMillis() - start);
-            return schedulingResult;
+        try (AutoCloseable ac = stateMonitor.enter()) {
+            return doScheduling(taskIterator, newLeases);
         } catch (Exception e) {
             logger.error("Error with scheduling run: " + e.getMessage(), e);
             if(e instanceof IllegalStateException)
@@ -616,99 +752,164 @@ public class TaskScheduler {
         }
     }
 
+    /**
+     * Variant of {@link #scheduleOnce(List, List)} that should be only used to schedule a pseudo iteration as it
+     * ignores the StateMonitor lock.
+     * @param taskIterator Iterator for tasks to assign resources to.
+     * @return a {@link SchedulingResult} object that contains a task assignment results map and other summaries
+     */
+    /* package */ SchedulingResult pseudoScheduleOnce(TaskIterator taskIterator) throws Exception {
+        return doScheduling(taskIterator, Collections.emptyList());
+    }
+
+    private SchedulingResult doScheduling(TaskIterator taskIterator,
+                                          List<VirtualMachineLease> newLeases) throws Exception {
+        long start = System.currentTimeMillis();
+        final SchedulingResult schedulingResult = doSchedule(taskIterator, newLeases);
+        if((lastVMPurgeAt + purgeVMsIntervalSecs*1000) < System.currentTimeMillis()) {
+            lastVMPurgeAt = System.currentTimeMillis();
+            logger.info("Purging inactive VMs");
+            assignableVMs.purgeInactiveVMs( // explicitly exclude VMs that have assignments
+                    schedulingResult.getResultMap() == null?
+                            Collections.emptySet() :
+                            new HashSet<>(schedulingResult.getResultMap().keySet())
+            );
+        }
+        schedulingResult.setRuntime(System.currentTimeMillis() - start);
+        return schedulingResult;
+    }
+
     private SchedulingResult doSchedule(
-            List<? extends TaskRequest> requests,
-            List<VirtualMachineLease> newLeases) {
+            TaskIterator taskIterator,
+            List<VirtualMachineLease> newLeases) throws Exception {
         AtomicInteger rejectedCount = new AtomicInteger();
         List<AssignableVirtualMachine> avms = assignableVMs.prepareAndGetOrderedVMs(newLeases, rejectedCount);
         if(logger.isDebugEnabled())
-            logger.debug("Found " + avms.size() + " VMs with non-zero offers to assign from");
+            logger.debug("Got {} avms", avms.size());
+        List<AssignableVirtualMachine> inactiveAVMs = assignableVMs.getInactiveVMs();
+        if(logger.isDebugEnabled())
+            logger.debug("Found {} VMs with non-zero offers to assign from", avms.size());
         final boolean hasResAllocs = resAllocsEvaluator.prepare();
         //logger.info("Got " + avms.size() + " AVMs to schedule on");
         int totalNumAllocations=0;
-        Set<TaskRequest> failedTasksForAutoScaler = new HashSet<>(requests);
+        Set<TaskRequest> failedTasksForAutoScaler = new HashSet<>();
         Map<String, VMAssignmentResult> resultMap = new HashMap<>(avms.size());
         final SchedulingResult schedulingResult = new SchedulingResult(resultMap);
-        if(!avms.isEmpty()) {
-            for(final TaskRequest task: requests) {
-                if(hasResAllocs) {
-                    if(resAllocsEvaluator.taskGroupFailed(task.taskGroupName())) {
-                        if(logger.isDebugEnabled())
-                            logger.debug("Resource allocation limits reached for task: " + task.getId());
-                        continue;
-                    }
-                    final AssignmentFailure resAllocsFailure = resAllocsEvaluator.hasResAllocs(task);
-                    if(resAllocsFailure != null) {
-                        final List<TaskAssignmentResult> failures = Collections.singletonList(new TaskAssignmentResult(assignableVMs.getDummyVM(),
-                                task, false, Collections.singletonList(resAllocsFailure), null, 0.0));
-                        schedulingResult.addFailures(task, failures);
-                        failedTasksForAutoScaler.remove(task); // don't scale up for resAllocs failures
-                        if(logger.isDebugEnabled())
-                            logger.debug("Resource allocation limit reached for task " + task.getId() + ": " + resAllocsFailure);
-                        continue;
-                    }
-                }
-                final AssignmentFailure maxResourceFailure = assignableVMs.getFailedMaxResource(null, task);
-                if(maxResourceFailure != null) {
-                    final List<TaskAssignmentResult> failures = Collections.singletonList(new TaskAssignmentResult(assignableVMs.getDummyVM(), task, false,
-                            Collections.singletonList(maxResourceFailure), null, 0.0));
-                    schedulingResult.addFailures(task, failures);
-                    if(logger.isDebugEnabled())
-                        logger.debug("Task " + task.getId() + ": maxResource failure: " + maxResourceFailure);
-                    continue;
-                }
-                // create batches of VMs to evaluate assignments concurrently across the batches
-                final BlockingQueue<AssignableVirtualMachine> virtualMachines = new ArrayBlockingQueue<>(avms.size(), false, avms);
-                int nThreads = (int)Math.ceil((double)avms.size()/ PARALLEL_SCHED_EVAL_MIN_BATCH_SIZE);
-                List<Future<EvalResult>> futures = new ArrayList<>();
-                if(logger.isDebugEnabled())
-                    logger.debug("Launching " + nThreads + " threads for evaluating assignments for task " + task.getId());
-                for(int b=0; b<nThreads && b<EXEC_SVC_THREADS; b++) {
-                    futures.add(executorService.submit(new Callable<EvalResult>() {
-                        @Override
-                        public EvalResult call() throws Exception {
-                            return evalAssignments(task, virtualMachines);
-                        }
-                    }));
-                }
-                List<EvalResult> results = new ArrayList<>();
-                List<TaskAssignmentResult> bestResults = new ArrayList<>();
-                for(Future<EvalResult> f: futures) {
-                    try {
-                        EvalResult evalResult = f.get();
-                        if(evalResult.exception!=null) {
-                            logger.warn("Error during concurrent task assignment eval - " + evalResult.exception.getMessage(),
-                                    evalResult.exception);
-                            schedulingResult.addException(evalResult.exception);
-                        }
-                        else {
-                            results.add(evalResult);
-                            bestResults.add(evalResult.result);
-                            if(logger.isDebugEnabled())
-                                logger.debug("Task " + task.getId() + ": best result so far: " + evalResult.result);
-                            totalNumAllocations += evalResult.numAllocationTrials;
-                        }
-                    } catch (InterruptedException|ExecutionException e) {
-                        logger.error("Unexpected during concurrent task assignment eval - " + e.getMessage(), e);
-                    }
-                }
-                if(!schedulingResult.getExceptions().isEmpty())
+        if(avms.isEmpty()) {
+            while (true) {
+                final Assignable<? extends TaskRequest> taskOrFailure = taskIterator.next();
+                if (taskOrFailure == null)
                     break;
-                TaskAssignmentResult successfulResult = getSuccessfulResult(bestResults);
-                List<TaskAssignmentResult> failures = new ArrayList<>();
-                if(successfulResult == null) {
+                failedTasksForAutoScaler.add(taskOrFailure.getTask());
+            }
+        } else {
+            schedulingEventListener.onScheduleStart();
+            try {
+                while (true) {
+                    final Assignable<? extends TaskRequest> taskOrFailure = taskIterator.next();
                     if(logger.isDebugEnabled())
-                        logger.debug("Task " + task.getId() + ": no successful results");
-                    for(EvalResult er: results)
-                        failures.addAll(er.assignmentResults);
-                    schedulingResult.addFailures(task, failures);
-                }
-                else {
+                        logger.debug("TaskSched: task=" + (taskOrFailure == null? "null" : taskOrFailure.getTask().getId()));
+                    if (taskOrFailure == null)
+                        break;
+                    if(taskOrFailure.hasFailure()) {
+                        schedulingResult.addFailures(
+                                taskOrFailure.getTask(),
+                                Collections.singletonList(new TaskAssignmentResult(
+                                        assignableVMs.getDummyVM(),
+                                        taskOrFailure.getTask(),
+                                        false,
+                                        Collections.singletonList(taskOrFailure.getAssignmentFailure()),
+                                        null,
+                                        0
+                                )
+                        ));
+                        continue;
+                    }
+                    TaskRequest task = taskOrFailure.getTask();
+                    failedTasksForAutoScaler.add(task);
+                    if(hasResAllocs) {
+                        if(resAllocsEvaluator.taskGroupFailed(task.taskGroupName())) {
+                            if(logger.isDebugEnabled())
+                                logger.debug("Resource allocation limits reached for task: " + task.getId());
+                            continue;
+                        }
+                        final AssignmentFailure resAllocsFailure = resAllocsEvaluator.hasResAllocs(task);
+                        if(resAllocsFailure != null) {
+                            final List<TaskAssignmentResult> failures = Collections.singletonList(new TaskAssignmentResult(assignableVMs.getDummyVM(),
+                                    task, false, Collections.singletonList(resAllocsFailure), null, 0.0));
+                            schedulingResult.addFailures(task, failures);
+                            failedTasksForAutoScaler.remove(task); // don't scale up for resAllocs failures
+                            if(logger.isDebugEnabled())
+                                logger.debug("Resource allocation limit reached for task " + task.getId() + ": " + resAllocsFailure);
+                            continue;
+                        }
+                    }
+                    final AssignmentFailure maxResourceFailure = assignableVMs.getFailedMaxResource(null, task);
+                    if(maxResourceFailure != null) {
+                        final List<TaskAssignmentResult> failures = Collections.singletonList(new TaskAssignmentResult(assignableVMs.getDummyVM(), task, false,
+                                Collections.singletonList(maxResourceFailure), null, 0.0));
+                        schedulingResult.addFailures(task, failures);
+                        if(logger.isDebugEnabled())
+                            logger.debug("Task {}: maxResource failure: {}", task.getId(), maxResourceFailure);
+                        continue;
+                    }
+                    // create batches of VMs to evaluate assignments concurrently across the batches
+                    final BlockingQueue<AssignableVirtualMachine> virtualMachines = new ArrayBlockingQueue<>(avms.size(), false, avms);
+                    int nThreads = (int)Math.ceil((double)avms.size()/ PARALLEL_SCHED_EVAL_MIN_BATCH_SIZE);
+                    List<Future<EvalResult>> futures = new ArrayList<>();
                     if(logger.isDebugEnabled())
-                        logger.debug("Task " + task.getId() + ": found successful assignment on host " + successfulResult.getHostname());
-                    successfulResult.assignResult();
-                    failedTasksForAutoScaler.remove(task);
+                        logger.debug("Launching {} threads for evaluating assignments for task {}", nThreads, task.getId());
+                    for(int b = 0; b<nThreads && b< maxConcurrent; b++) {
+                        futures.add(executorService.submit(new Callable<EvalResult>() {
+                            @Override
+                            public EvalResult call() throws Exception {
+                                return evalAssignments(task, virtualMachines);
+                            }
+                        }));
+                    }
+                    List<EvalResult> results = new ArrayList<>();
+                    List<TaskAssignmentResult> bestResults = new ArrayList<>();
+                    for(Future<EvalResult> f: futures) {
+                        try {
+                            EvalResult evalResult = f.get();
+                            if(evalResult.exception!=null) {
+                                logger.warn("Error during concurrent task assignment eval - " + evalResult.exception.getMessage(),
+                                        evalResult.exception);
+                                schedulingResult.addException(evalResult.exception);
+                            }
+                            else {
+                                results.add(evalResult);
+                                bestResults.add(evalResult.result);
+                                if(logger.isDebugEnabled())
+                                    logger.debug("Task {}: best result so far: {}", task.getId(), evalResult.result);
+                                totalNumAllocations += evalResult.numAllocationTrials;
+                            }
+                        } catch (InterruptedException|ExecutionException e) {
+                            logger.error("Unexpected during concurrent task assignment eval - " + e.getMessage(), e);
+                        }
+                    }
+                    if(!schedulingResult.getExceptions().isEmpty())
+                        break;
+                    TaskAssignmentResult successfulResult = getSuccessfulResult(bestResults);
+                    List<TaskAssignmentResult> failures = new ArrayList<>();
+                    if(successfulResult == null) {
+                        if(logger.isDebugEnabled())
+                            logger.debug("Task {}: no successful results", task.getId());
+                        for(EvalResult er: results)
+                            failures.addAll(er.assignmentResults);
+                        schedulingResult.addFailures(task, failures);
+                    }
+                    else {
+                        if(logger.isDebugEnabled())
+                            logger.debug("Task {}: found successful assignment on host {}", task.getId(),
+                                    successfulResult.getHostname());
+                        successfulResult.assignResult();
+                        failedTasksForAutoScaler.remove(task);
+                        schedulingEventListener.onAssignment(successfulResult);
+                    }
                 }
+            } finally {
+                schedulingEventListener.onScheduleFinish();
             }
         }
         List<VirtualMachineLease> idleResourcesList = new ArrayList<>();
@@ -724,10 +925,17 @@ public class TaskScheduler {
                     resultMap.put(avm.getHostname(), assignmentResult);
                 }
             }
+
+            // Process inactive VMs
+            List<VirtualMachineLease> idleInactiveAVMs = inactiveAVMs.stream()
+                    .filter(vm -> vm.getCurrTotalLease() != null && !vm.hasPreviouslyAssignedTasks())
+                    .map(AssignableVirtualMachine::getCurrTotalLease)
+                    .collect(Collectors.toList());
+
             rejectedCount.addAndGet(assignableVMs.removeLimitedLeases(expirableLeases));
-            final AutoScalerInput autoScalerInput = new AutoScalerInput(idleResourcesList, failedTasksForAutoScaler);
+            final AutoScalerInput autoScalerInput = new AutoScalerInput(idleResourcesList, idleInactiveAVMs, failedTasksForAutoScaler);
             if (autoScaler != null)
-                autoScaler.scheduleAutoscale(autoScalerInput);
+                autoScaler.doAutoscale(autoScalerInput);
         }
         schedulingResult.setLeasesAdded(newLeases.size());
         schedulingResult.setLeasesRejected(rejectedCount.get());
@@ -737,18 +945,38 @@ public class TaskScheduler {
         return schedulingResult;
     }
 
+    /* package */ Map<String, List<String>> createPseudoHosts(Map<String, Integer> groupCounts) {
+        return assignableVMs.createPseudoHosts(groupCounts, autoScaler == null? name -> null : autoScaler::getRule);
+    }
+
+    /* package */ void removePseudoHosts(Map<String, List<String>> hostsMap) {
+        assignableVMs.removePseudoHosts(hostsMap);
+    }
+
+    /* package */ void removePseudoAssignments() {
+        taskTracker.clearAssignedTasks(); // this should suffice for pseudo assignments
+    }
+
     /**
      * Returns the state of resources on all known hosts. You can use this for debugging or informational
      * purposes (occasionally). This method obtains and holds a lock for the duration of creating the state
      * information. Scheduling runs are blocked around the lock.
-     * 
+     *
      * @return a Map of state information with the hostname as the key and a Map of resource state as the value.
      *         The resource state Map contains a resource as the key and a two element Double array - the first
      *         element of which contains the amount of the resource used and the second element contains the
      *         amount still available (available does not include used).
      * @see <a href="https://github.com/Netflix/Fenzo/wiki/Insights#how-to-learn-which-resources-are-available-on-which-hosts">How to Learn Which Resources Are Available on Which Hosts</a>
+     * @throws IllegalStateException if called concurrently with {@link #scheduleOnce(List, List)} or if called when
+     * using a {@link TaskSchedulingService}.
      */
-    public Map<String, Map<VMResource, Double[]>> getResourceStatus() {
+    public Map<String, Map<VMResource, Double[]>> getResourceStatus() throws IllegalStateException {
+        if (usingSchedulingService)
+            throw new IllegalStateException(usingSchedSvcMesg);
+        return getResourceStatusIntl();
+    }
+
+    /* package */ Map<String, Map<VMResource, Double[]>> getResourceStatusIntl() {
         try (AutoCloseable ac = stateMonitor.enter()) {
             return assignableVMs.getResourceStatus();
         } catch (Exception e) {
@@ -761,13 +989,19 @@ public class TaskScheduler {
      * Returns the current state of all known hosts. You might occasionally use this for debugging or
      * informational purposes. If you call this method, it will obtain and hold a lock for as long as it takes
      * to create the state information. Scheduling runs are blocked around the lock.
-     * 
+     *
      * @return a list containing the current state of all known VMs
-     * @throws IllegalStateException if you call this concurrently with the main scheduling method,
-     *         {@link #scheduleOnce scheduleOnce()}
+     * @throws IllegalStateException if called concurrently with {@link #scheduleOnce(List, List)} or if called when
+     * using a {@link TaskSchedulingService}.
      * @see <a href="https://github.com/Netflix/Fenzo/wiki/Insights#how-to-learn-the-amount-of-resources-currently-available-on-particular-hosts">How to Learn the Amount of Resources Currently Available on Particular Hosts</a>
      */
     public List<VirtualMachineCurrentState> getVmCurrentStates() throws IllegalStateException {
+        if (usingSchedulingService)
+            throw new IllegalStateException(usingSchedSvcMesg);
+        return getVmCurrentStatesIntl();
+    }
+
+    /* package */ List<VirtualMachineCurrentState> getVmCurrentStatesIntl() throws IllegalStateException {
         try (AutoCloseable ac = stateMonitor.enter()) {
             return assignableVMs.getVmCurrentStates();
         }
@@ -791,9 +1025,12 @@ public class TaskScheduler {
                 if(n == 0)
                     return new EvalResult(results, getSuccessfulResult(results), results.size(), null);
                 for(int m=0; m<n; m++) {
-                    if(logger.isDebugEnabled())
-                        logger.debug("Evaluting task assignment on host " + buf.get(m).getHostname());
-                    TaskAssignmentResult result = buf.get(m).tryRequest(task, builder.fitnessCalculator);
+                    final AssignableVirtualMachine avm = buf.get(m);
+                    if(logger.isDebugEnabled()) {
+                        logger.debug("Evaluting task assignment on host " + avm.getHostname());
+                        logger.debug("CurrTotalRes on host {}: {}", avm.getHostname(), avm.getCurrTotalLease());
+                    }
+                    TaskAssignmentResult result = avm.tryRequest(task, builder.fitnessCalculator);
                     results.add(result);
                     if(result.isSuccessful() && builder.isFitnessGoodEnoughFunction.call(result.getFitness())) {
                         // drain rest of the queue, nobody needs to do more work.
@@ -873,18 +1110,24 @@ public class TaskScheduler {
      * Note that you may not call the task assigner action concurrently with
      * {@link #scheduleOnce(java.util.List, java.util.List) scheduleOnce()}. If you do so, the task assigner
      * action will throw an {@code IllegalStateException}.
-     * 
+     *
      * @return a task assigner action
      * @throws IllegalStateException if the scheduler is shutdown via the {@link #isShutdown} method.
      */
     public Action2<TaskRequest, String> getTaskAssigner() throws IllegalStateException {
+        if (usingSchedulingService)
+            throw new IllegalStateException(usingSchedSvcMesg);
+        return getTaskAssignerIntl();
+    }
+
+    /* package */Action2<TaskRequest, String> getTaskAssignerIntl() throws IllegalStateException {
         return new Action2<TaskRequest, String>() {
             @Override
             public void call(TaskRequest request, String hostname) {
                 try (AutoCloseable ac = stateMonitor.enter()) {
                     assignableVMs.setTaskAssigned(request, hostname);
                 } catch (Exception e) {
-                    logger.error("Unexpected error from state monitor: " + e.getMessage());
+                    logger.error("Unexpected error from state monitor: " + e.getMessage(), e);
                     throw new IllegalStateException(e);
                 }
             }
@@ -929,7 +1172,7 @@ public class TaskScheduler {
      * with that hostname, it creates a new object for it, and therefore your disabling of it will be remembered
      * when offers that concern that host come in later. The scheduler will not use disabled hosts for
      * allocating resources to tasks.
-     * 
+     *
      * @param hostname the name of the host to disable
      * @param durationMillis the length of time, starting from now, in milliseconds, during which the host will
      *        be disabled
@@ -945,7 +1188,7 @@ public class TaskScheduler {
      * that hostname, it creates a new object for it, and therefore your disabling of it will be remembered when
      * offers that concern that host come in later. The scheduler will not use disabled hosts for allocating
      * resources to tasks.
-     * 
+     *
      * @param vmID the ID of the host to disable
      * @param durationMillis the length of time, starting from now, in milliseconds, during which the host will
      *        be disabled
